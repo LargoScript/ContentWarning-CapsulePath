@@ -4,6 +4,6 @@ namespace CapsulePath
     {
         public const string GUID = "com.local.capsulepath";
         public const string Name = "Capsule Path";
-        public const string Version = "0.4.0";
+        public const string Version = "0.3.1";
     }
 }

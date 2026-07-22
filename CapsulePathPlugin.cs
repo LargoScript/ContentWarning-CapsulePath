@@ -300,9 +300,21 @@ namespace CapsulePath
                 if (i > 0 && pts.Count > 0 && dense.Length > 0)
                 {
                     // Climb arc over the obstacle between the two NavMesh pieces.
-                    Vector3 a   = pts[pts.Count - 1];
-                    Vector3 b   = dense[0];
-                    pts.Add((a + b) * 0.5f + Vector3.up * (Mathf.Abs(b.y - a.y) * 0.5f + 0.45f));
+                    // Skip the raised midpoint on a hairpin (next piece starts behind
+                    // the travel direction) - arcing a reversal reads as a knot.
+                    Vector3 a = pts[pts.Count - 1];
+                    Vector3 b = dense[0];
+                    bool hairpin = false;
+                    if (pts.Count >= 2)
+                    {
+                        Vector3 inDir = a - pts[pts.Count - 2];
+                        Vector3 abDir = b - a;
+                        inDir.y = 0f;
+                        abDir.y = 0f;
+                        hairpin = Vector3.Dot(inDir, abDir) < 0f;
+                    }
+                    if (!hairpin)
+                        pts.Add((a + b) * 0.5f + Vector3.up * (Mathf.Abs(b.y - a.y) * 0.5f + 0.45f));
                 }
                 pts.AddRange(dense);
             }
@@ -378,6 +390,7 @@ namespace CapsulePath
         {
             var result = new RouteResult();
             Vector3 cur = start;
+            float prevRemaining = float.MaxValue;
             for (int hop = 0; hop <= MaxBridges; hop++)
             {
                 if (!NavMesh.CalculatePath(cur, end, NavMesh.AllAreas, _navPath)) break;
@@ -385,22 +398,31 @@ namespace CapsulePath
                 if (corners == null || corners.Length < 2) break;
                 if (_navPath.status == NavMeshPathStatus.PathInvalid) break;
 
-                result.Segments.Add(corners);
-                result.NavLength += PolylineLength(corners);
+                Vector3 reached   = corners[corners.Length - 1];
+                float   remaining = Vector3.Distance(reached, end);
 
-                Vector3 reached = corners[corners.Length - 1];
-                result.RemainingToEnd = Vector3.Distance(reached, end);
-                if (_navPath.status == NavMeshPathStatus.PathComplete || result.RemainingToEnd <= EndReachTolerance)
+                // A bridged continuation must make real progress toward the capsule.
+                // Without this, resumes onto micro-islands ping-pong back and forth
+                // and the smoothed line ties knots in mid-air.
+                if (hop > 0 && remaining > prevRemaining - 1f) break;
+
+                result.Segments.Add(corners);
+                result.NavLength     += PolylineLength(corners);
+                result.RemainingToEnd = remaining;
+                prevRemaining         = remaining;
+
+                if (_navPath.status == NavMeshPathStatus.PathComplete || remaining <= EndReachTolerance)
                 {
                     result.Complete = true;
-                    return result;
+                    break;
                 }
 
                 if (!TryFindBridgeResume(reached, end, out Vector3 resume)) break;
-                result.Bridges++;
                 cur = resume;
             }
-            return result.Segments.Count > 0 ? result : null;
+            if (result.Segments.Count == 0) return null;
+            result.Bridges = result.Segments.Count - 1;
+            return result;
         }
 
         private static bool RouteBetter(RouteResult a, RouteResult b)
