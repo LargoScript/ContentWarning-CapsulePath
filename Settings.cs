@@ -37,4 +37,16 @@ namespace CapsulePath
 
         public string GetDisplayName() => "[CapsulePath] Hide path in camera footage";
     }
+
+    [ContentWarningSetting]
+    public class CapsulePathShowStatusSetting : BoolSetting, IExposedSetting
+    {
+        protected override bool GetDefaultValue() => true;
+
+        public override void ApplyValue() { }
+
+        public SettingCategory GetSettingCategory() => SettingCategory.Mods;
+
+        public string GetDisplayName() => "[CapsulePath] Show on-screen status";
+    }
 }

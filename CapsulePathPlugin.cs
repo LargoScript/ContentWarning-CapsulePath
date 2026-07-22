@@ -33,6 +33,27 @@ namespace CapsulePath
         private const float SurfaceSnapRadius = 1.5f;  // NavMesh.SamplePosition search radius
         private const float MaxLateralSnapSqr = 0.5f * 0.5f; // reject sideways snaps (m^2)
 
+        // The NavMesh is baked for walking monsters; players climb over low
+        // obstacles and NavMesh gaps without noticing. When a path comes back
+        // partial, probe past the blockage along the route direction and bridge
+        // onto the next NavMesh piece with a climb arc - but only if nothing
+        // taller than ClimbHeight (about half the player's body) is in the way.
+        private const float ClimbHeight      = 1.0f;  // max climbable obstacle height (m)
+        private const float MaxDropHeight    = 3.0f;  // max drop-down when bridging (m)
+        private const float BridgeProbeStep  = 0.75f; // spacing of probes past a blockage
+        private const float BridgeProbeMax   = 5f;    // how far past a blockage to search
+        private const float BridgeSnapRadius = 3.5f;  // vertical reach of resume sampling
+        private const float MaxProbeDriftSqr = 1.2f * 1.2f; // reject sideways resume snaps (m^2)
+        private const int   MaxBridges       = 3;     // climb arcs per route
+
+        // The nearest NavMesh sample can land on a disconnected island (prop tops,
+        // raised ledges) and produce a bogus "blocked" route; starts a couple of
+        // meters to the side often sit on the main mesh. Try a ring of candidates.
+        private const float StartSnapRadius   = 1.6f;
+        private const float StartRingRadius1  = 1.6f;
+        private const float StartRingRadius2  = 3.2f;
+        private const float EndReachTolerance = 1.6f; // arriving this close counts as reaching the capsule
+
         private static readonly Color PathColor  = new Color(0.15f, 1f, 0.25f, 0.45f);
         private static readonly Color ArrowColor = new Color(0.2f, 1f, 0.3f, 1f);
 
@@ -63,6 +84,18 @@ namespace CapsulePath
             }
         }
 
+        private CapsulePathShowStatusSetting _showStatusSetting;
+
+        private bool ShowStatusHud
+        {
+            get
+            {
+                if (_showStatusSetting == null)
+                    _showStatusSetting = GameHandler.Instance?.SettingsHandler?.GetSetting<CapsulePathShowStatusSetting>();
+                return _showStatusSetting == null || _showStatusSetting.Value;
+            }
+        }
+
         private readonly NavMeshPath       _navPath = new NavMeshPath();
         private          LineRenderer      _line;
         private readonly List<LineRenderer> _arrows = new List<LineRenderer>();
@@ -73,11 +106,23 @@ namespace CapsulePath
         private float     _arrowPhase;
 
         private bool    _pathVisible = true;
-        private Vector3? _capsulePos;
+        private Vector3? _capsulePos;   // camera-based fallback anchor (see TrackCapsulePosition)
+        private DivingBell _cachedBell; // preferred anchor: the actual capsule object
 
         // Per-camera "is this a VideoCamera lens?" cache; cleared on scene change.
         private readonly Dictionary<Camera, bool> _isRecordingCamera = new Dictionary<Camera, bool>();
         private bool _hiddenForRecording;
+
+        // On-screen status marker (OnGUI): a short message shown when a key is
+        // pressed so the player gets feedback even when no path is drawn. IMGUI is
+        // composited to the screen only, never into a VideoCamera RenderTexture,
+        // so this never leaks into recordings.
+        private const float StatusDuration = 3.2f; // seconds visible
+        private const float StatusFade     = 0.6f; // seconds of fade-out at the end
+        private string    _statusText;
+        private float     _statusShownAt = -100f;
+        private GUIStyle  _statusStyle;
+        private Texture2D _statusTex;
 
         // ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -102,6 +147,10 @@ namespace CapsulePath
                     _pathVisible = !_pathVisible;
                     if (_line != null) _line.enabled = _pathVisible;
                     SetArrowsVisible(_pathVisible);
+                    if (_smoothedPath == null)
+                        ShowStatus($"CapsulePath: press [{RecalculateKey}] to find the capsule");
+                    else
+                        ShowStatus(_pathVisible ? "CapsulePath: path shown" : "CapsulePath: path hidden");
                     Logger.LogInfo($"[CapsulePath] Visibility: {(_pathVisible ? "ON" : "OFF")}");
                 }
 
@@ -131,6 +180,7 @@ namespace CapsulePath
                 if (lr != null) Destroy(lr.gameObject);
             _arrows.Clear();
             if (_line != null) Destroy(_line.gameObject);
+            if (_statusTex != null) Destroy(_statusTex);
         }
 
         // ── hide from in-game camera footage ──────────────────────────────────
@@ -173,6 +223,7 @@ namespace CapsulePath
         private void OnActiveSceneChanged(Scene previous, Scene current)
         {
             _capsulePos = null;
+            _cachedBell = null;
             _isRecordingCamera.Clear();
             ClearPath();
             Logger.LogInfo($"[CapsulePath] Scene changed -> state reset ({current.name})");
@@ -199,59 +250,272 @@ namespace CapsulePath
 
         private void RecalculatePath()
         {
-            if (!_capsulePos.HasValue)
+            if (!TryGetCapsuleTarget(out Vector3 capsule, out string capsuleSrc))
             {
-                Logger.LogWarning("[CapsulePath] Capsule position is unknown yet.");
+                ShowStatus("CapsulePath: capsule not found yet (start the dive)");
+                Logger.LogWarning("[CapsulePath] Capsule target unknown (no diving bell, no anchor).");
                 return;
             }
 
             Player local = Player.localPlayer;
             if (local == null)
             {
+                ShowStatus("CapsulePath: player not ready");
                 Logger.LogWarning("[CapsulePath] Local player not found.");
                 return;
             }
 
             if (!TryGetLocalAvatarPosition(local, out Vector3 playerNow, out string source))
             {
+                ShowStatus("CapsulePath: player position unknown");
                 Logger.LogWarning("[CapsulePath] Could not resolve dynamic local avatar position.");
                 return;
             }
 
-            Vector3 start = playerNow;
-            Vector3 end   = _capsulePos.Value;
-
-            if (!TrySampleToNavMesh(ref start) || !TrySampleToNavMesh(ref end))
+            Vector3 end = capsule;
+            if (!TrySampleToNavMesh(ref end))
             {
-                Logger.LogWarning("[CapsulePath] Could not sample start/end to NavMesh. Using direct fallback.");
                 ClearPath();
-                ApplyPath(new[] { playerNow + Vector3.up * 0.2f, _capsulePos.Value + Vector3.up * 0.2f });
+                ApplyPath(new[] { playerNow + Vector3.up * 0.2f, capsule + Vector3.up * 0.2f });
+                ShowStatus(WithVisibilityHint("CapsulePath: direct line (off NavMesh)"));
+                Logger.LogWarning("[CapsulePath] Could not sample capsule to NavMesh. Using direct fallback.");
                 return;
             }
 
-            bool hasPath = NavMesh.CalculatePath(start, end, NavMesh.AllAreas, _navPath);
-            if (!hasPath || _navPath.corners == null || _navPath.corners.Length < 2
-                || _navPath.status == NavMeshPathStatus.PathInvalid)
+            RouteResult route = ComputeRoute(playerNow, end);
+            if (route == null)
             {
+                ClearPath();
+                ApplyPath(new[] { playerNow + Vector3.up * 0.2f, capsule + Vector3.up * 0.2f });
+                ShowStatus(WithVisibilityHint("CapsulePath: no route - direct line"));
                 Logger.LogWarning("[CapsulePath] Path not found/invalid. Using direct fallback.");
-                ClearPath();
-                ApplyPath(new[] { playerNow + Vector3.up * 0.2f, _capsulePos.Value + Vector3.up * 0.2f });
                 return;
             }
 
-            if (_navPath.status == NavMeshPathStatus.PathPartial)
-                Logger.LogWarning("[CapsulePath] Path is partial - it stops at the closest reachable point, not at the capsule.");
+            var pts = new List<Vector3>(128);
+            for (int i = 0; i < route.Segments.Count; i++)
+            {
+                Vector3[] segCorners = DropCoincidentCorners(route.Segments[i], MinCornerSpacing);
+                Vector3[] dense      = DensifyOnNavMesh(segCorners);
+                if (i > 0 && pts.Count > 0 && dense.Length > 0)
+                {
+                    // Climb arc over the obstacle between the two NavMesh pieces.
+                    Vector3 a   = pts[pts.Count - 1];
+                    Vector3 b   = dense[0];
+                    pts.Add((a + b) * 0.5f + Vector3.up * (Mathf.Abs(b.y - a.y) * 0.5f + 0.45f));
+                }
+                pts.AddRange(dense);
+            }
 
-            Vector3[] corners = DropCoincidentCorners(_navPath.corners, MinCornerSpacing);
-            Vector3[] dense   = DensifyOnNavMesh(corners);
-            Vector3[] lifted  = LiftCorners(dense, 0.12f);
-            Vector3[] smooth  = CatmullRom(lifted, SplineSteps);
+            Vector3[] lifted = LiftCorners(pts.ToArray(), 0.12f);
+            Vector3[] smooth = CatmullRom(lifted, SplineSteps);
             ApplyPath(smooth);
 
-            float totalLen = 0f;
-            for (int i = 1; i < _navPath.corners.Length; i++)
-                totalLen += Vector3.Distance(_navPath.corners[i - 1], _navPath.corners[i]);
-            Logger.LogInfo($"[CapsulePath] Path OK. Corners={_navPath.corners.Length}, pts={smooth.Length}, len={totalLen:F1}m, src={source}");
+            if (route.Complete)
+                ShowStatus(WithVisibilityHint(route.Bridges > 0
+                    ? $"CapsulePath: {route.NavLength:F0} m to capsule (short climb on the way)"
+                    : $"CapsulePath: {route.NavLength:F0} m to capsule"));
+            else
+                ShowStatus(WithVisibilityHint($"CapsulePath: partial route ~{route.NavLength:F0} m (capsule may be blocked)"));
+
+            if (!route.Complete)
+                Logger.LogWarning("[CapsulePath] Route is partial - it stops at the closest reachable point, not at the capsule.");
+            Logger.LogInfo($"[CapsulePath] Route: segments={route.Segments.Count}, bridges={route.Bridges}, complete={route.Complete}, pts={smooth.Length}, len={route.NavLength:F1}m, src={source}, tgt={capsuleSrc}");
+        }
+
+        // ── routing (start candidates + climb bridging) ────────────────────────
+
+        private sealed class RouteResult
+        {
+            public readonly List<Vector3[]> Segments = new List<Vector3[]>();
+            public bool  Complete;
+            public int   Bridges;
+            public float NavLength;
+            public float RemainingToEnd = float.MaxValue;
+        }
+
+        private RouteResult ComputeRoute(Vector3 rawStart, Vector3 end)
+        {
+            RouteResult best = null;
+            foreach (Vector3 start in StartCandidates(rawStart))
+            {
+                RouteResult r = RouteFrom(start, end);
+                if (r == null) continue;
+                if (best == null || RouteBetter(r, best)) best = r;
+                if (best.Complete) break;
+            }
+            return best;
+        }
+
+        private static IEnumerable<Vector3> StartCandidates(Vector3 raw)
+        {
+            var yielded = new List<Vector3>(20);
+            bool Fresh(Vector3 p)
+            {
+                foreach (Vector3 q in yielded)
+                    if ((p - q).sqrMagnitude < 0.25f) return false;
+                yielded.Add(p);
+                return true;
+            }
+
+            if (NavMesh.SamplePosition(raw, out NavMeshHit direct, StartSnapRadius, NavMesh.AllAreas) && Fresh(direct.position))
+                yield return direct.position;
+
+            foreach (float radius in new[] { StartRingRadius1, StartRingRadius2 })
+                for (int i = 0; i < 8; i++)
+                {
+                    float ang = i * Mathf.PI * 2f / 8f;
+                    Vector3 probe = raw + new Vector3(Mathf.Sin(ang), 0f, Mathf.Cos(ang)) * radius;
+                    if (NavMesh.SamplePosition(probe, out NavMeshHit hit, StartSnapRadius, NavMesh.AllAreas) && Fresh(hit.position))
+                        yield return hit.position;
+                }
+
+            if (NavMesh.SamplePosition(raw, out NavMeshHit wide, 4f, NavMesh.AllAreas) && Fresh(wide.position))
+                yield return wide.position;
+        }
+
+        private RouteResult RouteFrom(Vector3 start, Vector3 end)
+        {
+            var result = new RouteResult();
+            Vector3 cur = start;
+            for (int hop = 0; hop <= MaxBridges; hop++)
+            {
+                if (!NavMesh.CalculatePath(cur, end, NavMesh.AllAreas, _navPath)) break;
+                Vector3[] corners = _navPath.corners;
+                if (corners == null || corners.Length < 2) break;
+                if (_navPath.status == NavMeshPathStatus.PathInvalid) break;
+
+                result.Segments.Add(corners);
+                result.NavLength += PolylineLength(corners);
+
+                Vector3 reached = corners[corners.Length - 1];
+                result.RemainingToEnd = Vector3.Distance(reached, end);
+                if (_navPath.status == NavMeshPathStatus.PathComplete || result.RemainingToEnd <= EndReachTolerance)
+                {
+                    result.Complete = true;
+                    return result;
+                }
+
+                if (!TryFindBridgeResume(reached, end, out Vector3 resume)) break;
+                result.Bridges++;
+                cur = resume;
+            }
+            return result.Segments.Count > 0 ? result : null;
+        }
+
+        private static bool RouteBetter(RouteResult a, RouteResult b)
+        {
+            if (a.Complete != b.Complete) return a.Complete;
+            return a.RemainingToEnd < b.RemainingToEnd - 0.25f;
+        }
+
+        private static bool TryFindBridgeResume(Vector3 from, Vector3 target, out Vector3 resume)
+        {
+            Vector3 dir = target - from;
+            dir.y = 0f;
+            if (dir.sqrMagnitude < 0.01f) { resume = default; return false; }
+            dir.Normalize();
+
+            float fromDist = HorizontalDistance(from, target);
+            for (float d = BridgeProbeStep; d <= BridgeProbeMax; d += BridgeProbeStep)
+            {
+                Vector3 probe = from + dir * d + Vector3.up * 0.4f;
+                if (!NavMesh.SamplePosition(probe, out NavMeshHit hit, BridgeSnapRadius, NavMesh.AllAreas))
+                    continue;
+
+                Vector3 drift = hit.position - probe;
+                drift.y = 0f;
+                if (drift.sqrMagnitude > MaxProbeDriftSqr) continue;
+
+                float rise = hit.position.y - from.y;
+                if (rise > ClimbHeight || rise < -MaxDropHeight) continue;
+
+                // Must make real progress toward the capsule, not hop sideways.
+                if (HorizontalDistance(hit.position, target) > fromDist - 0.5f) continue;
+
+                // The obstacle must be vaultable: nothing may block at climb height.
+                // This is what keeps bridges from ever crossing real walls.
+                if (Physics.Linecast(from + Vector3.up * (ClimbHeight + 0.15f),
+                                     hit.position + Vector3.up * (ClimbHeight + 0.15f),
+                                     Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                    continue;
+
+                resume = hit.position;
+                return true;
+            }
+            resume = default;
+            return false;
+        }
+
+        private static float HorizontalDistance(Vector3 a, Vector3 b)
+        {
+            float dx = a.x - b.x, dz = a.z - b.z;
+            return Mathf.Sqrt(dx * dx + dz * dz);
+        }
+
+        private static float PolylineLength(Vector3[] pts)
+        {
+            float len = 0f;
+            for (int i = 1; i < pts.Length; i++)
+                len += Vector3.Distance(pts[i - 1], pts[i]);
+            return len;
+        }
+
+        private string WithVisibilityHint(string msg)
+        {
+            return _pathVisible ? msg : msg + $"  (hidden - [{ToggleViewKey}] to show)";
+        }
+
+        // ── capsule target resolution ──────────────────────────────────────────
+        // Prefer the real DivingBell object over the camera position latched at
+        // dive start: the camera anchor is the player's head wherever they stood,
+        // so NavMesh sampling could land a few meters off the actual capsule.
+
+        private bool TryGetCapsuleTarget(out Vector3 target, out string source)
+        {
+            DivingBell bell = ResolveDivingBell();
+            if (bell != null)
+            {
+                target = DivingBellAnchor(bell);
+                source = "DivingBell";
+                return true;
+            }
+            if (_capsulePos.HasValue)
+            {
+                target = _capsulePos.Value;
+                source = "camera-anchor";
+                return true;
+            }
+            target = default;
+            source = "none";
+            return false;
+        }
+
+        private DivingBell ResolveDivingBell()
+        {
+            if (_cachedBell != null) return _cachedBell;
+            // The underground capsule is the DivingBell with onSurface == false;
+            // ignore the surface (house) bell so the mod stays a dive-only helper.
+            foreach (DivingBell b in Object.FindObjectsByType<DivingBell>(FindObjectsSortMode.None))
+                if (b != null && !b.onSurface) { _cachedBell = b; break; }
+            return _cachedBell;
+        }
+
+        private static Vector3 DivingBellAnchor(DivingBell bell)
+        {
+            // The player-detector transforms mark where players stand inside the
+            // bell - the most reliable "walk to here" target. Average them; fall
+            // back to the bell's own transform if none are wired up.
+            Transform[] det = bell.playerDetector != null ? bell.playerDetector.m_detectors : null;
+            if (det != null && det.Length > 0)
+            {
+                Vector3 sum = Vector3.zero;
+                int n = 0;
+                foreach (Transform t in det)
+                    if (t != null) { sum += t.position; n++; }
+                if (n > 0) return sum / n;
+            }
+            return bell.transform.position;
         }
 
         // ── Catmull-Rom smoothing ──────────────────────────────────────────────
@@ -527,6 +791,73 @@ namespace CapsulePath
                 return null;
             }
             return new Material(shader) { color = color };
+        }
+
+        // ── on-screen status marker ────────────────────────────────────────────
+
+        private void ShowStatus(string text)
+        {
+            _statusText    = text;
+            _statusShownAt = Time.unscaledTime;
+        }
+
+        private void OnGUI()
+        {
+            if (string.IsNullOrEmpty(_statusText) || !ShowStatusHud) return;
+
+            float age = Time.unscaledTime - _statusShownAt;
+            if (age < 0f || age > StatusDuration) return;
+            float alpha = age > StatusDuration - StatusFade
+                ? Mathf.Clamp01((StatusDuration - age) / StatusFade)
+                : 1f;
+
+            EnsureStatusStyle();
+            float pad  = Mathf.Round(Screen.height * 0.012f);
+            float dot  = _statusStyle.fontSize;
+            Vector2 ts = _statusStyle.CalcSize(new GUIContent(_statusText));
+            float boxW = ts.x + dot + pad * 3f;
+            float boxH = Mathf.Max(ts.y, dot) + pad * 2f;
+            float x    = Mathf.Round(Screen.width * 0.03f);
+            float y    = Mathf.Round(Screen.height * 0.5f - boxH * 0.5f);
+
+            Color prev = GUI.color;
+
+            // Panel
+            GUI.color = new Color(0f, 0f, 0f, 0.66f * alpha);
+            GUI.DrawTexture(new Rect(x, y, boxW, boxH), _statusTex);
+
+            // Activity marker: green while a path is drawn and visible, grey otherwise.
+            GUI.color = (_smoothedPath != null && _pathVisible)
+                ? new Color(0.2f, 1f, 0.3f, alpha)
+                : new Color(0.6f, 0.6f, 0.6f, alpha);
+            GUI.DrawTexture(new Rect(x + pad, y + (boxH - dot) * 0.5f, dot, dot), _statusTex);
+
+            // Text
+            GUI.color = new Color(1f, 1f, 1f, alpha);
+            GUI.Label(new Rect(x + pad * 2f + dot, y, ts.x + pad, boxH), _statusText, _statusStyle);
+
+            GUI.color = prev;
+        }
+
+        private void EnsureStatusStyle()
+        {
+            if (_statusTex == null)
+            {
+                _statusTex = new Texture2D(1, 1) { hideFlags = HideFlags.HideAndDontSave };
+                _statusTex.SetPixel(0, 0, Color.white);
+                _statusTex.Apply();
+            }
+            if (_statusStyle == null)
+            {
+                _statusStyle = new GUIStyle
+                {
+                    alignment = TextAnchor.MiddleLeft,
+                    fontStyle = FontStyle.Bold,
+                    richText  = false,
+                };
+                _statusStyle.normal.textColor = Color.white;
+            }
+            _statusStyle.fontSize = Mathf.Clamp(Mathf.RoundToInt(Screen.height * 0.022f), 12, 40);
         }
 
         // ── player position helpers ────────────────────────────────────────────
